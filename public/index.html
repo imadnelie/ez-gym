@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EZ Gym Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="toast"></div>
+  <div id="authView" class="centered">
+    <form id="loginForm" class="card auth-card">
+      <h1>EZ Gym CRM</h1>
+      <p>Sign in to continue</p>
+      <label>Username<input name="username" required /></label>
+      <label>Password<input name="password" type="password" required /></label>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+
+  <div id="appView" class="hidden">
+    <header>
+      <div>
+        <h2>Gym Management Dashboard</h2>
+        <small id="whoami"></small>
+      </div>
+      <button id="logoutBtn" class="outline">Logout</button>
+    </header>
+    <nav id="tabs"></nav>
+    <main id="content"></main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
+  <script src="/app.js?v=6"></script>
+</body>
+</html>
