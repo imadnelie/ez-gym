@@ -53,6 +53,10 @@ thead th:last-child { border-top-right-radius: 10px; }
 .payment-summary div { border: 1px solid #e7edf7; background: #fafcff; border-radius: 10px; padding: 10px; display: grid; gap: 4px; }
 .payment-summary span { color: #667085; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .payment-summary strong { font-size: 15px; }
+.purchase-price-preview { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 2px 0 6px; }
+.purchase-price-preview div { border: 1px solid #dbeafe; background: #eff6ff; border-radius: 10px; padding: 10px; display: grid; gap: 4px; }
+.purchase-price-preview span { color: #667085; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.purchase-price-preview strong { font-size: 15px; color: #1d4ed8; }
 .receipt-modal { width: min(860px, 100%); }
 .receipt-actions-head { border-bottom: 1px solid #edf2fa; padding-bottom: 10px; }
 .receipt-print-area { border: 1px solid #e7edf7; border-radius: 14px; padding: 18px; background: #fff; display: grid; gap: 16px; }

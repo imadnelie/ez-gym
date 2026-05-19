@@ -34,6 +34,30 @@ async function api(path, opts = {}) {
 function fmtMoney(v) { return `$${Number(v || 0).toFixed(2)}`; }
 function esc(v) { return `${v ?? ''}`.replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\'': '&#39;', '"': '&quot;' }[c])); }
 function paymentStatusClass(v) { return `${v || ''}`.toLowerCase().replace(/\s+/g, '-'); }
+function fmtDiscountLabel(p) {
+  if (!p?.discount_type || p.discount_type === 'none' || !Number(p.discount_amount)) return '-';
+  if (p.discount_type === 'percentage') return `${p.discount_value}% (${fmtMoney(p.discount_amount)})`;
+  return fmtMoney(p.discount_amount);
+}
+function fmtDiscountTypeLabel(type) {
+  if (type === 'percentage') return 'Percentage';
+  if (type === 'amount') return 'Fixed Amount';
+  return 'None';
+}
+function calcClientPricing(packagePrice, discountType, discountValue) {
+  const price = Number(packagePrice || 0);
+  const type = discountType || 'none';
+  const value = Number(discountValue || 0);
+  if (!price) return { original: 0, discountAmount: 0, final: 0 };
+  if (type === 'none') return { original: price, discountAmount: 0, final: price };
+  if (type === 'percentage') {
+    const pct = Math.min(100, Math.max(0, value));
+    const discountAmount = Math.round((price * pct) / 100 * 100) / 100;
+    return { original: price, discountAmount, final: Math.max(0, Math.round((price - discountAmount) * 100) / 100) };
+  }
+  const discountAmount = Math.round(Math.min(price, Math.max(0, value)) * 100) / 100;
+  return { original: price, discountAmount, final: Math.max(0, Math.round((price - discountAmount) * 100) / 100) };
+}
 
 function financialSnapshotHtml(d) {
   const snapshot = d.financialSnapshot || d;
@@ -427,6 +451,15 @@ async function renderPurchases() {
   content.innerHTML = '';
   content.appendChild(section);
 
+  function getFormOriginalPrice(packageId) {
+    if (!packageId) return 0;
+    if (editingPurchase && Number(editingPurchase.package_id) === Number(packageId) && editingPurchase.original_price != null) {
+      return Number(editingPurchase.original_price);
+    }
+    const pack = (lookups.packages || []).find((x) => Number(x.id) === Number(packageId));
+    return Number(pack?.price || 0);
+  }
+
   function purchaseFormHtml() {
     const editing = Boolean(editingPurchase);
     const purchaseDateValue = editing && dayjs(editingPurchase.purchase_date).isValid()
@@ -435,6 +468,10 @@ async function renderPurchases() {
     const expiryDateValue = editing && editingPurchase.expiry_date && dayjs(editingPurchase.expiry_date).isValid()
       ? dayjs(editingPurchase.expiry_date).format('YYYY-MM-DD')
       : '';
+    const discountType = editingPurchase?.discount_type || 'none';
+    const discountValue = editingPurchase?.discount_value ?? 0;
+    const selectedPackageId = editingPurchase?.package_id || '';
+    const preview = calcClientPricing(getFormOriginalPrice(selectedPackageId), discountType, discountValue);
     const currentPackageOptions = editing && !packageOptions.some((o) => Number(o.value) === Number(editingPurchase.package_id))
       ? [...packageOptions, { value: editingPurchase.package_id, label: `${editingPurchase.package_name} (${editingPurchase.training_type_name})` }]
       : packageOptions;
@@ -444,6 +481,15 @@ async function renderPurchases() {
       <label>Client<select name="client_id" required>${[{ value: '', label: 'Select client' }, ...clientOptions].map((o) => optionHtml(o, editingPurchase?.client_id)).join('')}</select></label>
       <label>Package<select name="package_id" required>${[{ value: '', label: 'Select package' }, ...currentPackageOptions].map((o) => optionHtml(o, editingPurchase?.package_id)).join('')}</select></label>
       ${editing ? `<label>Sessions purchased<input name="sessions_purchased" type="number" min="${esc(editingPurchase.sessions_used)}" required value="${esc(editingPurchase.sessions_purchased)}"></label>` : ''}
+      <label>Discount type<select name="discount_type">
+        ${[{ value: 'none', label: 'None' }, { value: 'percentage', label: 'Percentage' }, { value: 'amount', label: 'Amount' }].map((o) => optionHtml(o, discountType)).join('')}
+      </select></label>
+      <label>Discount value<input name="discount_value" type="number" min="0" step="0.01" value="${esc(discountValue)}" ${discountType === 'none' ? 'disabled' : ''}></label>
+      <div id="purchasePricePreview" class="purchase-price-preview">
+        <div><span>Original price</span><strong data-preview-original>${fmtMoney(preview.original)}</strong></div>
+        <div><span>Discount amount</span><strong data-preview-discount>${fmtMoney(preview.discountAmount)}</strong></div>
+        <div><span>Final price</span><strong data-preview-final>${fmtMoney(preview.final)}</strong></div>
+      </div>
       <label>Purchase date<input type="date" name="purchase_date" required value="${esc(purchaseDateValue)}"></label>
       <label>Expiry date<input type="date" name="expiry_date" value="${esc(expiryDateValue)}"></label>
       <label>Status<select name="status">
@@ -452,6 +498,35 @@ async function renderPurchases() {
       <button id="savePurchaseBtn" type="submit">${editing ? 'Update' : 'Create'}</button>
       <button id="cancelPurchaseBtn" class="outline" type="button">Cancel</button>
     </form>`;
+  }
+
+  function wirePurchaseFormPricing(form) {
+    if (!form) return;
+    const packageInput = form.querySelector('[name="package_id"]');
+    const discountTypeInput = form.querySelector('[name="discount_type"]');
+    const discountValueInput = form.querySelector('[name="discount_value"]');
+    const previewOriginal = form.querySelector('[data-preview-original]');
+    const previewDiscount = form.querySelector('[data-preview-discount]');
+    const previewFinal = form.querySelector('[data-preview-final]');
+
+    const refreshPreview = () => {
+      const discountType = discountTypeInput.value || 'none';
+      discountValueInput.disabled = discountType === 'none';
+      if (discountType === 'none') discountValueInput.value = '0';
+      const pricing = calcClientPricing(
+        getFormOriginalPrice(packageInput.value),
+        discountType,
+        discountValueInput.value
+      );
+      if (previewOriginal) previewOriginal.textContent = fmtMoney(pricing.original);
+      if (previewDiscount) previewDiscount.textContent = fmtMoney(pricing.discountAmount);
+      if (previewFinal) previewFinal.textContent = fmtMoney(pricing.final);
+    };
+
+    packageInput.onchange = refreshPreview;
+    discountTypeInput.onchange = refreshPreview;
+    discountValueInput.oninput = refreshPreview;
+    refreshPreview();
   }
 
   function paymentModalHtml() {
@@ -467,9 +542,11 @@ async function renderPurchases() {
         <div class="payment-summary">
           <div><span>Client</span><strong>${esc(p.client_name)}</strong></div>
           <div><span>Package</span><strong>${esc(p.package_name)}</strong></div>
-          <div><span>Price</span><strong>${fmtMoney(p.package_price)}</strong></div>
+          <div><span>Original price</span><strong>${fmtMoney(p.original_price ?? p.package_price)}</strong></div>
+          <div><span>Discount</span><strong>${esc(fmtDiscountLabel(p))}</strong></div>
+          <div><span>Final price</span><strong>${fmtMoney(p.final_price ?? p.package_price)}</strong></div>
           <div><span>Already paid</span><strong>${fmtMoney(p.total_paid)}</strong></div>
-          <div><span>Remaining</span><strong>${fmtMoney(remaining)}</strong></div>
+          <div><span>Remaining balance</span><strong>${fmtMoney(remaining)}</strong></div>
         </div>
         <input type="hidden" name="client_id" value="${esc(p.client_id)}">
         <input type="hidden" name="package_purchase_id" value="${esc(p.id)}">
@@ -496,7 +573,11 @@ async function renderPurchases() {
       `Client: ${r.client.name}`,
       `Package: ${r.package.name}`,
       `Training Type: ${r.package.training_type_name}`,
-      `Package Price: ${fmtMoney(r.purchase.package_price)}`,
+      `Original Price: ${fmtMoney(r.purchase.original_price ?? r.purchase.package_price)}`,
+      `Discount Type: ${fmtDiscountTypeLabel(r.purchase.discount_type)}`,
+      `Discount Value: ${r.purchase.discount_type === 'percentage' ? `${r.purchase.discount_value || 0}%` : fmtMoney(r.purchase.discount_value || 0)}`,
+      `Discount Amount: ${fmtMoney(r.purchase.discount_amount || 0)}`,
+      `Final Price: ${fmtMoney(r.purchase.final_price ?? r.purchase.package_price)}`,
       `Sessions Purchased: ${r.purchase.sessions_purchased}`,
       `Sessions Used: ${r.purchase.sessions_used}`,
       `Remaining Sessions: ${r.purchase.sessions_remaining}`,
@@ -637,7 +718,11 @@ async function renderPurchases() {
         <div><span>Client</span><strong>${esc(r.client.name)}</strong></div>
         <div><span>Package</span><strong>${esc(r.package.name)}</strong></div>
         <div><span>Training Type</span><strong>${esc(r.package.training_type_name)}</strong></div>
-        <div><span>Package Price</span><strong>${fmtMoney(r.purchase.package_price)}</strong></div>
+        <div><span>Original Price</span><strong>${fmtMoney(r.purchase.original_price ?? r.purchase.package_price)}</strong></div>
+        <div><span>Discount Type</span><strong>${esc(fmtDiscountTypeLabel(r.purchase.discount_type))}</strong></div>
+        <div><span>Discount Value</span><strong>${r.purchase.discount_type === 'percentage' ? esc(`${r.purchase.discount_value || 0}%`) : fmtMoney(r.purchase.discount_value || 0)}</strong></div>
+        <div><span>Discount Amount</span><strong>${fmtMoney(r.purchase.discount_amount || 0)}</strong></div>
+        <div><span>Final Price</span><strong>${fmtMoney(r.purchase.final_price ?? r.purchase.package_price)}</strong></div>
         <div><span>Sessions Purchased</span><strong>${esc(r.purchase.sessions_purchased)}</strong></div>
         <div><span>Sessions Used</span><strong>${esc(r.purchase.sessions_used)}</strong></div>
         <div><span>Remaining Sessions</span><strong>${esc(r.purchase.sessions_remaining)}</strong></div>
@@ -677,9 +762,11 @@ async function renderPurchases() {
     return `<tr>
       <td data-label="Client">${esc(p.client_name)}</td>
       <td data-label="Package">${esc(p.package_name)}</td>
-      <td data-label="Price">${fmtMoney(p.package_price)}</td>
+      <td data-label="Original Price">${fmtMoney(p.original_price ?? p.package_price)}</td>
+      <td data-label="Discount">${esc(fmtDiscountLabel(p))}</td>
+      <td data-label="Final Price">${fmtMoney(p.final_price ?? p.package_price)}</td>
       <td data-label="Paid">${fmtMoney(p.total_paid)}</td>
-      <td data-label="Remaining">${fmtMoney(p.remaining_balance)}</td>
+      <td data-label="Remaining Balance">${fmtMoney(p.remaining_balance)}</td>
       <td data-label="Payment Status"><span class="status payment-${paymentStatusClass(p.payment_status)}">${esc(p.payment_status)}</span></td>
       <td data-label="Sessions Purchased">${esc(p.sessions_purchased)}</td>
       <td data-label="Used">${esc(p.sessions_used)}</td>
@@ -718,7 +805,7 @@ async function renderPurchases() {
       ${purchaseFormHtml()}
       <div class="table-wrap">
         ${data.length ? `<table><thead><tr>
-          <th>Client</th><th>Package</th><th>Price</th><th>Paid</th><th>Remaining</th><th>Payment Status</th>
+          <th>Client</th><th>Package</th><th>Original Price</th><th>Discount</th><th>Final Price</th><th>Paid</th><th>Remaining Balance</th><th>Payment Status</th>
           <th>Sessions Purchased</th><th>Used</th><th>Remaining Sessions</th><th>Date</th><th>Expiry Date</th><th>Status</th><th>Actions</th>
         </tr></thead><tbody>${data.map(purchaseRowHtml).join('')}</tbody></table>` : '<div class="empty">No records yet.</div>'}
       </div>
@@ -740,6 +827,7 @@ async function renderPurchases() {
 
     const purchaseForm = section.querySelector('#purchaseForm');
     if (purchaseForm) {
+      wirePurchaseFormPricing(purchaseForm);
       if (isPurchaseFormOpen && !purchaseForm.querySelector('[name="purchase_date"]').value) {
         purchaseForm.querySelector('[name="purchase_date"]').value = dayjs().format('YYYY-MM-DD');
       }
@@ -749,6 +837,11 @@ async function renderPurchases() {
         body.client_id = Number(body.client_id);
         body.package_id = Number(body.package_id);
         if (body.sessions_purchased !== undefined) body.sessions_purchased = Number(body.sessions_purchased);
+        if (body.discount_type === 'none') {
+          body.discount_value = 0;
+        } else {
+          body.discount_value = Number(body.discount_value || 0);
+        }
         try {
           const endpoint = editingPurchase ? `/api/purchases/${editingPurchase.id}` : '/api/purchases';
           await api(endpoint, { method: editingPurchase ? 'PUT' : 'POST', body: JSON.stringify(body) });

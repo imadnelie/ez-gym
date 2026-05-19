@@ -8,7 +8,8 @@
     "seed": "node src/seed.js",
     "reset-db": "node src/seed.js --reset",
     "cleanup": "node src/cleanup.js",
-    "migrate:mongo": "node src/migrate-sqlite-to-mongo.js"
+    "migrate:mongo": "node src/migrate-sqlite-to-mongo.js",
+    "backfill:purchase-pricing": "node src/backfill-purchase-pricing.js"
   },
   "keywords": [],
   "author": "",

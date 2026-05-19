@@ -4,11 +4,18 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const dayjs = require('dayjs');
-const { connectMongo, mongoose } = require('./mongo/connection');
+const { connectMongo, ensureMongoConnected, closeMongo, mongoose, readyStateLabel } = require('./mongo/connection');
 const models = require('./mongo/models');
 const { toApi, toApiMany, pickPublicUser, boolFromRequest } = require('./mongo/serialize');
 const { authRequired, signToken } = require('./middleware/auth');
 const { nowIso, parsePagination } = require('./lib/utils');
+const {
+  packageSnapshotPrice,
+  resolveStoredPricing,
+  calculatePurchasePricing,
+  paymentStatus
+} = require('./lib/purchasePricing');
+const { backfillPurchasePricing } = require('./backfill-purchase-pricing');
 
 const {
   User,
@@ -55,19 +62,6 @@ function effectivePurchaseStatus(p, now = dayjs()) {
   if (p.status !== 'active') return p.status;
   if (p.expiry_date && dayjs(p.expiry_date).isValid() && dayjs(p.expiry_date).isBefore(now, 'day')) return 'expired';
   return p.status;
-}
-
-function packageSnapshotPrice(purchase, pack) {
-  const snapshotPrice = Number(purchase?.package_snapshot?.price);
-  if (Number.isFinite(snapshotPrice)) return snapshotPrice;
-  const livePrice = Number(pack?.price);
-  return Number.isFinite(livePrice) ? livePrice : 0;
-}
-
-function paymentStatus(totalPaid, packagePrice) {
-  if (Number(totalPaid) === 0) return 'Unpaid';
-  if (Number(totalPaid) < Number(packagePrice)) return 'Partially Paid';
-  return 'Fully Paid';
 }
 
 function bookingStatusUsesSession(status) {
@@ -122,10 +116,10 @@ async function purchaseRows(purchases) {
 
   return rows.map((p) => {
     const pack = packageById.get(p.package_id);
-    const price = packageSnapshotPrice(p, pack);
+    const pricing = resolveStoredPricing(p, pack);
     const pay = paymentByPurchase.get(p.legacyId) || {};
     const totalPaid = Number(pay.total_paid || 0);
-    const remainingBalance = Math.max(price - totalPaid, 0);
+    const remainingBalance = Math.max(pricing.final_price - totalPaid, 0);
     return {
       ...toApi(p),
       stored_status: p.status,
@@ -133,12 +127,17 @@ async function purchaseRows(purchases) {
       client_name: fullName(clientById.get(p.client_id)) || '-',
       package_name: pack?.name || p.package_snapshot?.name || '-',
       training_type_name: typeById.get(p.training_type_id)?.name || '-',
-      package_price: price,
+      original_price: pricing.original_price,
+      discount_type: pricing.discount_type,
+      discount_value: pricing.discount_value,
+      discount_amount: pricing.discount_amount,
+      final_price: pricing.final_price,
+      package_price: pricing.original_price,
       total_paid: totalPaid,
       payment_count: Number(pay.payment_count || 0),
       booking_count: Number(bookingByPurchase.get(p.legacyId)?.booking_count || 0),
       remaining_balance: remainingBalance,
-      payment_status: paymentStatus(totalPaid, price)
+      payment_status: paymentStatus(totalPaid, pricing.final_price)
     };
   });
 }
@@ -460,14 +459,29 @@ app.get('/api/purchases/:id/receipt', async (req, res) => {
     receipt: { number: `PUR-${purchase.legacyId}`, title: 'Package Purchase Receipt', generated_at: nowIso() },
     client: { id: client?.legacyId, name: fullName(client), first_name: client?.first_name, last_name: client?.last_name, phone: client?.phone, notes: client?.notes },
     package: { id: pack?.legacyId, name: pack?.name || purchase.package_snapshot?.name, training_type_id: tt?.legacyId, training_type_name: tt?.name, current_price: pack?.price, current_sessions: pack?.sessions_count, description: pack?.description },
-    purchase: { id: purchase.legacyId, purchase_date: purchase.purchase_date, expiry_date: purchase.expiry_date, status: row.status, stored_status: purchase.status, sessions_purchased: purchase.sessions_purchased, sessions_used: purchase.sessions_used, sessions_remaining: purchase.sessions_remaining, package_price: row.package_price },
+    purchase: {
+      id: purchase.legacyId,
+      purchase_date: purchase.purchase_date,
+      expiry_date: purchase.expiry_date,
+      status: row.status,
+      stored_status: purchase.status,
+      sessions_purchased: purchase.sessions_purchased,
+      sessions_used: purchase.sessions_used,
+      sessions_remaining: purchase.sessions_remaining,
+      original_price: row.original_price,
+      discount_type: row.discount_type,
+      discount_value: row.discount_value,
+      discount_amount: row.discount_amount,
+      final_price: row.final_price,
+      package_price: row.original_price
+    },
     payment_summary: { payment_status: row.payment_status, total_paid: row.total_paid, remaining_balance: row.remaining_balance, payment_count: row.payment_count },
     payments
   });
 });
 
 app.post('/api/purchases', async (req, res) => {
-  const { client_id, package_id, purchase_date, expiry_date, status } = req.body || {};
+  const { client_id, package_id, purchase_date, expiry_date, status, discount_type, discount_value } = req.body || {};
   if (!client_id || !package_id || !purchase_date) return res.status(400).json({ message: 'Missing required fields' });
   if (status && !['active', 'inactive', 'expired'].includes(status)) return res.status(400).json({ message: 'Invalid purchase status' });
   const [client, pack, user] = await Promise.all([
@@ -477,6 +491,12 @@ app.post('/api/purchases', async (req, res) => {
   ]);
   if (!client) return res.status(400).json({ message: 'Client not found' });
   if (!pack) return res.status(400).json({ message: 'Package not found or inactive' });
+  let pricing;
+  try {
+    pricing = calculatePurchasePricing(pack.price, discount_type || 'none', discount_value || 0);
+  } catch (e) {
+    return res.status(400).json({ message: e.message });
+  }
   const tt = await TrainingType.findOne({ legacyId: pack.training_type_id });
   const now = nowIso();
   const doc = await Purchase.create({
@@ -491,6 +511,7 @@ app.post('/api/purchases', async (req, res) => {
     sessions_purchased: pack.sessions_count,
     sessions_used: 0,
     sessions_remaining: pack.sessions_count,
+    ...pricing,
     purchase_date,
     expiry_date: expiry_date || null,
     status: status || 'active',
@@ -525,6 +546,19 @@ app.put('/api/purchases/:id', async (req, res) => {
   if (bookingCount && (clientChanged || packageChanged)) return res.status(409).json({ message: 'Cannot change client or package while linked bookings exist. Booking records are preserved.' });
   const pack = packageChanged ? await Package.findOne({ legacyId: packageId, active: true }) : await Package.findOne({ legacyId: packageId });
   if (!pack) return res.status(400).json({ message: 'Package not found or inactive' });
+  const discountType = req.body.discount_type !== undefined ? req.body.discount_type : (ex.discount_type || 'none');
+  const discountValue = req.body.discount_value !== undefined ? req.body.discount_value : (ex.discount_value || 0);
+  const originalPrice = packageChanged
+    ? pack.price
+    : (ex.original_price != null && Number.isFinite(Number(ex.original_price))
+      ? Number(ex.original_price)
+      : packageSnapshotPrice(ex, pack));
+  let pricing;
+  try {
+    pricing = calculatePurchasePricing(originalPrice, discountType, discountValue);
+  } catch (e) {
+    return res.status(400).json({ message: e.message });
+  }
   const tt = await TrainingType.findOne({ legacyId: pack.training_type_id });
   const updated = await Purchase.findOneAndUpdate({ legacyId: id }, {
     $set: {
@@ -537,6 +571,7 @@ app.put('/api/purchases/:id', async (req, res) => {
       trainingType: tt?._id,
       sessions_purchased: sessionsPurchased,
       sessions_remaining: sessionsPurchased - ex.sessions_used,
+      ...pricing,
       purchase_date: purchaseDate,
       expiry_date: expiryDate,
       status,
@@ -741,10 +776,14 @@ app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ 
 async function start() {
   try {
     await connectMongo();
+    console.log(`[mongo] connected successfully (readyState=${readyStateLabel()})`);
     await Promise.all(Object.values(models).map((Model) => Model.init()));
+    const { updated } = await backfillPurchasePricing({ disconnect: false });
+    if (updated) console.log(`[server] backfilled pricing fields on ${updated} existing purchase(s)`);
+    await ensureMongoConnected();
     const server = app.listen(PORT);
     server.on('listening', () => {
-      console.log(`EZ Gym server running on http://localhost:${PORT}`);
+      console.log(`[server] started on http://localhost:${PORT} (mongo readyState=${readyStateLabel()})`);
     });
     server.on('error', (err) => {
       if (err.code === 'EADDRINUSE') console.error(`[server] port ${PORT} is already in use. Stop the other server process and retry.`);
@@ -753,6 +792,11 @@ async function start() {
     });
   } catch (err) {
     console.error('[server] startup failed:', err.stack || err);
+    try {
+      await closeMongo();
+    } catch (_closeErr) {
+      // ignore cleanup errors during failed startup
+    }
     process.exit(1);
   }
 }
